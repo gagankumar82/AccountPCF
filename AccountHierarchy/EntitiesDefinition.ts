@@ -31,3 +31,23 @@ export interface fieldDefinition {
   displayName?: string;
   statecode? : number;
 }
+
+/** One attribute inside each node (value, displayName, and its type) */
+export interface ChartAttribute {
+  value: string | null;
+  displayName: string;
+  type: string;
+}
+
+/** The shape of each node that d3-org-chart sees */
+export interface ChartNode {
+  id: string;
+  parentId: string | null;
+  name: {
+    value: string | null;
+    statecode: number;
+  };
+  attributes: ChartAttribute[];
+  /** the chart uses this internally for highlights */
+  _highlighted?: boolean;
+}
