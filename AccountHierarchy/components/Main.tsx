@@ -1,299 +1,170 @@
-// --- Final Fixed Main.tsx with all remaining errors resolved ---
-
-import { useState, useEffect } from "react";
-import * as React from "react";
-import OrgChartComponent from "./OrgChartComponent";
-import { fieldDefinition, Mapping } from "../EntitiesDefinition";
-import { Button, Input } from "@fluentui/react-components";
+import * as React from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
+import { IInputs } from '../generated/ManifestTypes';
+import OrgChartComponent from './OrgChartComponent';
+import {
+  Mapping,
+  fieldDefinition,
+  ChartNode,
+} from '../EntitiesDefinition';
+import { Button, Input } from '@fluentui/react-components';
 import {
   ZoomInRegular,
   ZoomOutRegular,
   SearchRegular,
   PageFitRegular,
   ArrowNextRegular,
-} from "@fluentui/react-icons";
+} from '@fluentui/react-icons';
 
-interface AppProps {
-  context: ComponentFramework.Context<any>;
+// Extend the PCF Mode interface to expose contextInfo
+interface ContextInfo {
+  entityTypeName?: string;
+  entityId?: string;
+}
+interface ExtendedMode extends ComponentFramework.Mode {
+  contextInfo?: ContextInfo;
+}
+
+interface MainProps {
+  context: ComponentFramework.Context<IInputs>;
   jsonMapping: string;
 }
 
-const App = ({ context, jsonMapping: rawMapping }: AppProps) => {
-  const [data, setData] = useState<any[] | null>(null);
-  const [jsonMappingControl, setJsonMappingControl] = useState<Mapping | null>(null);
-  const [searchOnGoing, setSearchOnGoing] = useState<boolean>(true);
+const Main: React.FC<MainProps> = ({ context, jsonMapping }) => {
+  const [data, setData] = useState<ChartNode[]>([]);
+  const [mappingControl, setMappingControl] = useState<Mapping | null>(null);
 
-  const jsonMapping: Mapping = JSON.parse(rawMapping);
-  jsonInputCheck(jsonMapping);
+  // Handlers that will be wired up by OrgChartComponent
+  const zoomHandler = useRef<(dir: string) => void>(() => {});
+  const searchHandler = useRef<(term: string) => void>(() => {});
+  const nextHandler = useRef<() => void>(() => {});
 
-  const contextInfo = (context.mode as any)["contextInfo"] ?? {}; // ✅ fix the contextInfo error
-  jsonMapping.entityName = contextInfo.entityTypeName ?? "";
+  // Parse mapping JSON only when it changes
+  const mapping: Mapping = useMemo(
+    () => JSON.parse(jsonMapping) as Mapping,
+    [jsonMapping]
+  );
 
-  const fields: fieldDefinition[] = extractFields(jsonMapping);
+  // Pull entity info out of context.mode.contextInfo
+  const ctxInfo = (context.mode as ExtendedMode).contextInfo ?? {};
+  mapping.entityName = ctxInfo.entityTypeName ?? '';
+  if (ctxInfo.entityId) {
+    mapping.recordIdValue = ctxInfo.entityId;
+  }
 
-  let clickZoom: ((z: string) => void) | null = null;
-  let searchNode: ((value: string) => void) | null = null;
-  let searchNextNode: (() => void) | null = null;
+  // Build the list of fields we need to fetch
+  const fields: fieldDefinition[] = useMemo(() => {
+    const base: fieldDefinition[] = [
+      { name: mapping.recordIdField },
+      { name: mapping.parentField },
+      ...mapping.mapping.map((m) => ({ name: m })),
+    ];
+    if (mapping.lookupOtherTable) {
+      base.push({ name: mapping.lookupOtherTable });
+    }
+    return base;
+  }, [mapping]);
 
+  // Load hierarchy data once on mount
   useEffect(() => {
-    const getAllData = async () => {
-      let dataEM = await context.utils.getEntityMetadata(
-        jsonMapping.entityName ?? "",
-        fields.map((u) => u.name)
+    const load = async () => {
+      // Retrieve metadata (you can use it in OrgChartComponent if needed)
+      await context.utils.getEntityMetadata(mapping.entityName, fields.map(f => f.name));
+
+      // Find top ancestor
+      const parentResp = await context.webAPI.retrieveMultipleRecords(
+        mapping.entityName,
+        `?$filter=Microsoft.Dynamics.CRM.Above(PropertyName='${mapping.recordIdField}',PropertyValue='${mapping.recordIdValue}') and _${mapping.parentField}_value eq null`
+      );
+      const topId =
+        parentResp.entities.length > 0
+          ? parentResp.entities[0][mapping.recordIdField]
+          : mapping.recordIdValue!;
+
+      // Fetch full subtree
+      const select = fields
+        .filter(f => f.webapiName)
+        .map(f => f.webapiName!)
+        .join(',');
+      const childrenResp = await context.webAPI.retrieveMultipleRecords(
+        mapping.entityName,
+        `?$filter=Microsoft.Dynamics.CRM.UnderOrEqual(PropertyName='${mapping.recordIdField}',PropertyValue='${topId}')&$select=${select},statecode`
       );
 
-      dataEM = await isExternalLookup(dataEM, jsonMapping);
-      getAttributeDetails(dataEM);
+      // Format into ChartNode[]
+      const formatted: ChartNode[] = childrenResp.entities.map(rec => {
+        // first mapped field => node name, rest => attributes
+        const name = {
+          value: rec[mapping.mapping[0]] as string | null,
+          statecode: rec.statecode,
+        };
+        const attrs = mapping.mapping.slice(1).map((fld) => ({
+          value: (rec[fld] as string | null),
+          displayName: fld,
+          type: 'text',
+        }));
+        return {
+          id: rec[mapping.recordIdField] as string,
+          parentId: (rec[mapping.parentField] as string | null) ?? null,
+          name,
+          attributes: attrs,
+        };
+      });
 
-      const getTopParentData = await context.webAPI.retrieveMultipleRecords(
-        jsonMapping.entityName ?? "",
-        `?$filter=Microsoft.Dynamics.CRM.Above(PropertyName='${jsonMapping.recordIdField}',PropertyValue='${jsonMapping.recordIdValue}') and _${jsonMapping.parentField}_value eq null`
-      );
-
-      const getTopParentDataId =
-        getTopParentData.entities.length === 0
-          ? jsonMapping.recordIdValue
-          : getTopParentData.entities[0][jsonMapping.recordIdField];
-
-      const concatFields = fields
-        .filter((f) => f.webapiName)
-        .map((f) => f.webapiName)
-        .join(",");
-
-      const getChildrenData = await context.webAPI.retrieveMultipleRecords(
-        jsonMapping.entityName ?? "",
-        `?$filter=Microsoft.Dynamics.CRM.UnderOrEqual(PropertyName='${jsonMapping.recordIdField}',PropertyValue='${getTopParentDataId}')&$select=${concatFields},statecode`
-      );
-
-      const jsonData = formatJson(getChildrenData.entities, jsonMapping);
-      setJsonMappingControl(jsonMapping);
-      setData(jsonData);
+      setMappingControl({ ...mapping });
+      setData(formatted);
     };
 
-    getAllData();
-  }, []);
+    load();
+  }, [context, fields, mapping]);
 
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "flex-start" }}>
-        {jsonMapping.properties?.showZoom && (
-          <div id="carfup_HierarchyControl_zoom">
-            <Button icon={<ZoomInRegular />} onClick={() => zoom("in")} title="Zoom In" />
-            &nbsp;
-            <Button icon={<ZoomOutRegular />} onClick={() => zoom("out")} title="Zoom Out" />
-            &nbsp;
-            <Button icon={<PageFitRegular />} onClick={() => zoom("fit")} title="Fit to screen" />
-            &nbsp;
-          </div>
+      {/* Toolbar */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+        {mapping.properties?.showZoom && (
+          <>
+            <Button icon={<ZoomInRegular />} onClick={() => zoomHandler.current('in')} />
+            <Button icon={<ZoomOutRegular />} onClick={() => zoomHandler.current('out')} />
+            <Button icon={<PageFitRegular />} onClick={() => zoomHandler.current('fit')} />
+          </>
         )}
-        {jsonMapping.properties?.showSearch && (
-          <Input
-            contentAfter={<SearchRegular />}
-            placeholder="Search"
-            onChange={(e) => search((e.target as HTMLInputElement).value)}
-          />
-        )}&nbsp;
-        {jsonMapping.properties?.showSearch && (
-          <Button
-            icon={<ArrowNextRegular />}
-            onClick={() => searchNext()}
-            title="Search Next Result"
-            disabled={searchOnGoing}
-          />
+        {mapping.properties?.showSearch && (
+          <>
+            <Input
+              placeholder="Search"
+              contentAfter={<SearchRegular />}
+              onChange={(e) => searchHandler.current((e.target as HTMLInputElement).value)}
+            />
+            <Button icon={<ArrowNextRegular />} onClick={() => nextHandler.current()} />
+          </>
         )}
       </div>
+
+      {/* Chart */}
       <div
-        id="carfup_HierarchyControl"
         style={{
-          width: jsonMapping.properties?.width ?? context.mode.allocatedWidth + "px",
-          height: jsonMapping.properties?.height ?? context.mode.allocatedHeight + "px",
+          width: mapping.properties?.width ?? context.mode.allocatedWidth,
+          height: mapping.properties?.height ?? context.mode.allocatedHeight,
         }}
       >
-        <OrgChartComponent
-          data={data ?? []}
-          mapping={jsonMappingControl!}
-          setZoom={(z: (zoom: string) => void) => {
-            clickZoom = z;
-          }}
-          setSearch={(s: (value: string) => void) => {
-            searchNode = s;
-          }}
-          setSearchNext={(s: () => void) => {
-            searchNextNode = s;
-          }}
-          context={context}
-          size={{
-            width: jsonMapping.properties?.width ?? context.mode.allocatedWidth,
-            height: jsonMapping.properties?.height ?? context.mode.allocatedHeight,
-          }}
-        />
+        {mappingControl && (
+          <OrgChartComponent
+            data={data}
+            mapping={mappingControl}
+            setZoom={(h) => { zoomHandler.current = h; }}
+            setSearch={(h) => { searchHandler.current = h; }}
+            setSearchNext={(h) => { nextHandler.current = h; }}
+            context={context}
+            size={{
+              width: mapping.properties?.width ?? context.mode.allocatedWidth,
+              height: mapping.properties?.height ?? context.mode.allocatedHeight,
+            }}
+          />
+        )}
       </div>
     </div>
   );
-
-  function zoom(zoom = "in") {
-    clickZoom?.(zoom);
-  }
-
-  function search(value: string) {
-    searchNode?.(value);
-    setSearchOnGoing(value === "" || value == null);
-  }
-
-  function searchNext() {
-    searchNextNode?.();
-  }
-
-  function renameKey(
-    obj: Record<string, any>,
-    oldKey: string,
-    newKey: string,
-    targetJson: any
-  ) {
-    if (oldKey) {
-      if (["id", "parentId"].includes(newKey)) {
-        targetJson[newKey] = obj[oldKey];
-      } else {
-        let key = oldKey;
-        const type = fields.find((f) => f.webapiName === oldKey)?.type;
-        if (type && ["lookup", "datetime", "picklist"].includes(type)) {
-          key = `${oldKey}@OData.Community.Display.V1.FormattedValue`;
-        }
-        const details = {
-          value: getValue(obj[key], type),
-          type,
-          displayName: fields.find((f) => f.webapiName === oldKey)?.displayName,
-          statecode: obj.statecode,
-        };
-        if (newKey === "attribute") {
-          targetJson.push(details);
-        } else {
-          targetJson[newKey] = details;
-        }
-      }
-    }
-  }
-
-  function getValue(value: any, type?: string) {
-    let result = value;
-    switch (type) {
-      case "date":
-        result = context.formatting.formatDateShort(new Date(value));
-        break;
-      case "money":
-        result = context.formatting.formatCurrency(value);
-        break;
-    }
-    return result === undefined ? null : result;
-  }
-
-  function getAttributeDetails(em: any) {
-    em.Attributes.forEach((attr: any) => {
-      const index = fields.findIndex((f) => f.name === attr.LogicalName);
-      fields[index].webapiName =
-        em.PrimaryAttributeId !== attr.LogicalName &&
-        ["lookup", "owner", "customer"].includes(attr.AttributeTypeName)
-          ? `_${attr.LogicalName}_value`
-          : attr.LogicalName;
-      fields[index].type = returnType(attr);
-      fields[index].displayName = attr.DisplayName;
-    });
-  }
-
-  function formatJson(jsonData: any[], mapping: Mapping) {
-    const targetJson: any[] = [];
-    jsonData.forEach((obj) => {
-      const propsTarget: any = { attributes: [] };
-      renameKey(obj, isLookup(mapping.recordIdField), "id", propsTarget);
-      renameKey(obj, isLookup(mapping.parentField), "parentId", propsTarget);
-      mapping.mapping.forEach((field, index) => {
-        if (index === 0) {
-          renameKey(obj, isLookup(field), "name", propsTarget);
-        } else {
-          renameKey(obj, isLookup(field), "attribute", propsTarget.attributes);
-        }
-      });
-      targetJson.push(propsTarget);
-    });
-    return targetJson;
-  }
-
-  function extractFields(jsonMapping: Mapping): fieldDefinition[] {
-    const fields: fieldDefinition[] = [
-      { name: jsonMapping.recordIdField },
-      { name: jsonMapping.parentField },
-      ...jsonMapping.mapping.map((field) => ({ name: field })),
-    ];
-    if (jsonMapping.lookupOtherTable) fields.push({ name: jsonMapping.lookupOtherTable });
-    return fields;
-  }
-
-  function isLookup(field: string) {
-    return fields.find((f) => f.name === field)?.type === "lookup"
-      ? `_${field}_value`
-      : field;
-  }
-
-  function returnType(attr: any): string {
-    let result = attr.AttributeTypeName;
-    switch (attr.AttributeTypeName) {
-      case "owner":
-      case "partylist":
-      case "customer":
-      case "lookup":
-        result = "lookup";
-        break;
-      case "decimal":
-      case "double":
-      case "integer":
-      case "int":
-      case "bigint":
-        result = "number";
-        break;
-      case "string":
-        switch (attr.attributeDescriptor?.FormatName) {
-          case "Url":
-            result = "url";
-            break;
-          case "Phone":
-            result = "phone";
-            break;
-        }
-        break;
-    }
-    return result;
-  }
-
-  async function isExternalLookup(dataEM: any, jsonMapping: Mapping) {
-    const contextInfo = (context.mode as any)["contextInfo"];
-    let lookupTableDetails = dataEM;
-    if (jsonMapping.lookupOtherTable) {
-      const lookupField = dataEM.Attributes._collection[jsonMapping.lookupOtherTable];
-      lookupTableDetails = await context.utils.getEntityMetadata(
-        lookupField.Targets[0],
-        fields.map((u) => u.name)
-      );
-      const lookupFieldValue = await context.webAPI.retrieveRecord(
-        jsonMapping.entityName ?? "",
-        contextInfo.entityId,
-        `?$select=_${jsonMapping.lookupOtherTable}_value`
-      );
-      jsonMapping.entityName = lookupTableDetails.LogicalName;
-      jsonMapping.recordIdField = lookupTableDetails.PrimaryIdAttribute;
-      jsonMapping.recordIdValue = lookupFieldValue[`_${jsonMapping.lookupOtherTable}_value`];
-    } else {
-      jsonMapping.recordIdValue = contextInfo.entityId;
-    }
-    return lookupTableDetails;
-  }
-
-  function jsonInputCheck(mapping: Mapping) {
-    if (mapping.mapping.includes("attribute1")) {
-      alert(
-        "Hierarchy control PCF :\nPlease make sure that you updated the JSON schema of the Hierarchy control to properly works.\n\nPlease go to https://github.com/carfup/PCF_HierarchyControl to have the new JSON schema."
-      );
-    }
-  }
 };
 
-export default App;
+export default Main;
