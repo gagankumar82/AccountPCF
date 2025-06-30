@@ -1,21 +1,30 @@
-import * as React from 'react';
-import { useEffect, useRef } from 'react';
-import { OrgChart } from 'd3-org-chart';
-import { IInputs } from '../generated/ManifestTypes';
-import { Mapping, ChartNode, ChartAttribute } from '../EntitiesDefinition';
+import * as React from "react";
+import { useEffect, useRef } from "react";
+import { OrgChart } from "d3-org-chart";
+import { Mapping, ChartNode } from "../EntitiesDefinition";
+import { IInputs } from "../generated/ManifestTypes";
 
 interface OrgChartComponentProps {
   data: ChartNode[];
   mapping: Mapping;
-  setZoom: (handler: (direction: string) => void) => void;
-  setSearch: (handler: (term: string) => void) => void;
+  setZoom: (handler: (zoom: string) => void) => void;
+  setSearch: (handler: (value: string) => void) => void;
   setSearchNext: (handler: () => void) => void;
   context: ComponentFramework.Context<IInputs>;
-  size: { width: number; height: number };
+  size: {
+    width: number;
+    height: number;
+  };
 }
 
-// For nodeContent callback
-interface RenderNode {
+interface NavigationExe {
+  navigateTo(opts: {
+    pageType: "entityrecord";
+    entityName: string;
+    entityId: string;
+  }): Promise<void>;
+}
+interface OrgChartRenderNode {
   data: ChartNode;
   width: number;
   height: number;
@@ -32,73 +41,91 @@ const OrgChartComponent: React.FC<OrgChartComponentProps> = ({
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<OrgChart>(new OrgChart());
+  //let searchRecords: Array<{ id: string; viewed: boolean }> = [];
+  let searchRecords: { id: string; viewed: boolean }[] = [];
 
-  // Keep track of search hits
-  let searchHits: Array<{ id: string; viewed: boolean }> = [];
-
-  // Zoom in / out / fit
-  const zoom = (dir: string = 'in') => {
-    if (dir === 'in') chartRef.current.zoomIn();
-    else if (dir === 'out') chartRef.current.zoomOut();
-    else chartRef.current.fit();
+  // Zoom control
+  const zoom = (direction = "in"): void => {
+    if (direction === "in") {
+      chartRef.current.zoomIn();
+    } else if (direction === "out") {
+      chartRef.current.zoomOut();
+    } else {
+      chartRef.current.fit();
+    }
   };
 
-  // Search highlights
-  const search = (term: string) => {
+  // Text‐search & highlight
+  const search = (term: string): void => {
     chartRef.current.clearHighlighting();
-    searchHits = [];
-    const lower = term.trim().toLowerCase();
+    searchRecords = [];
     const nodes = chartRef.current.data() as ChartNode[];
-    nodes.forEach((n) => {
-      if (lower && n.name.value?.toLowerCase().includes(lower)) {
-        (n as any)._highlighted = true;
-        searchHits.push({ id: n.id, viewed: false });
+    nodes.forEach((node) => {
+      const name = node.name.value ?? "";
+      if (
+        term.trim() !== "" &&
+        name.toLowerCase().includes(term.toLowerCase())
+      ) {
+       // (node as any)._highlighted = true;
+       (node as ChartNode & { _highlighted?: boolean })._highlighted = true;
+        searchRecords.push({ id: node.id, viewed: false });
       }
     });
     chartRef.current.data(nodes).render();
-    attachNavListeners();
+    attachListeners();
   };
 
-  // Cycle through matches
-  const focusNext = () => {
-    const next = searchHits.find((h) => !h.viewed);
+  // Cycle focus through highlighted nodes
+  const focusNext = (): void => {
+    const next = searchRecords.find((r) => !r.viewed);
     if (next) {
       chartRef.current.setCentered(next.id).render();
       next.viewed = true;
     } else {
-      searchHits.forEach((h) => (h.viewed = false));
-      if (searchHits.length) focusNext();
+      searchRecords.forEach((r) => (r.viewed = false));
+      if (searchRecords.length > 0) {
+        focusNext();
+      }
     }
   };
 
-  // Click handler for link icon
-  const attachNavListeners = () => {
+  // Attach click handlers for the “link” icon in each node
+  const attachListeners = (): void => {
     const nodes = chartRef.current.data() as ChartNode[];
-    nodes.forEach((n) => {
-      const el = document.getElementById(`navi_${n.id}`);
-      if (el) el.addEventListener('click', () => navigate(n.id));
+    nodes.forEach((node) => {
+      const el = document.getElementById(`navi_${node.id}`);
+      if (el) {
+        el.addEventListener("click", () => navigateTo(node.id));
+      }
     });
   };
 
   // Navigate to record form
-  const navigate = (id: string) => {
-    (context.navigation as any).navigateTo({
-      pageType: 'entityrecord',
-      entityName: mapping.entityName,
-      entityId: id,
-    });
+  const navigateTo = (id: string): void => {
+    // PCF navigation API is loosely typed
+   // (context.navigation as any).navigateTo({
+    //  pageType: "entityrecord",
+     // entityName: mapping.entityName ?? "",
+    //  entityId: id,
+  //  });
+  const nav = context.navigation as unknown as NavigationExe;
+nav.navigateTo({
+  pageType: "entityrecord",
+  entityName: mapping.entityName || "",
+  entityId: id,
+});
   };
 
-  // Expose handlers once on mount
+  // Register parent‐exposed handlers on mount
   useEffect(() => {
     setZoom(zoom);
     setSearch(search);
     setSearchNext(focusNext);
   }, []);
 
-  // Render/update chart when data changes
+  // Render or re-render chart whenever `data` changes
   useEffect(() => {
-    if (data.length && containerRef.current) {
+    if (data.length > 0 && containerRef.current) {
       let chart = chartRef.current
         .container(containerRef.current)
         .data(data)
@@ -109,46 +136,64 @@ const OrgChartComponent: React.FC<OrgChartComponentProps> = ({
         .compactMarginPair(() => 80)
         .initialZoom(0.8)
         .setActiveNodeCentered(true)
-        .nodeContent((d: RenderNode) => {
+        .nodeContent((d: OrgChartRenderNode) => {
           const isActive = d.data.id === mapping.recordIdValue;
-          const initials = (d.data.name.value ?? '')
-            .split(' ')
+          const initials = (d.data.name.value ?? "")
+            .split(" ")
             .slice(0, 2)
-            .map(w => w.charAt(0).toUpperCase())
-            .join('');
+            .map((w) => w.charAt(0).toUpperCase())
+            .join("");
           const attrsHtml = d.data.attributes
             .map(
-              (a: ChartAttribute) =>
-                a.value
-                  ? `<div title="${a.displayName}">${getIcon(a.type)} ${a.value}</div>`
-                  : ''
+              (attr) =>
+                attr.value
+                  ? `<div title="${attr.displayName}">${getIcon(
+                      attr.type
+                    )} ${attr.value}</div>`
+                  : ""
             )
-            .join('');
+            .join("");
           return `
-            <div style="width:${d.width}px; height:${d.height}px;">
-              <div style="border:1px solid ${isActive ? '#FF0000' : '#E4E2E9'}; background:#fff; padding:4px;">
-                <span id="navi_${d.data.id}" style="cursor:pointer;">${getIcon('link')}</span>
-                <span style="font-weight:bold; margin-left:8px;">${initials}</span>
-                <div style="margin-top:8px;">${d.data.name.value ?? ''}</div>
-                <div style="margin-top:4px; font-size:12px;">${attrsHtml}</div>
+            <div style="width:${d.width}px;height:${d.height}px;">
+              <div style="border:1px solid ${
+                isActive ? "#FF0000" : "#E4E2E9"
+              };padding:4px;background:#fff;">
+                <span id="navi_${d.data.id}" style="cursor:pointer;">
+                  ${getIcon("link")}
+                </span>
+                <span style="font-weight:bold;margin-left:8px;">
+                  ${initials}
+                </span>
+                <div style="margin-top:8px;font-size:14px;">
+                  ${d.data.name.value ?? ""}
+                </div>
+                <div style="margin-top:4px;font-size:12px;">
+                  ${attrsHtml}
+                </div>
               </div>
             </div>`;
         })
         .expandAll();
 
-      if (size.width > 0) chart = chart.svgWidth(size.width);
-      if (size.height > 0) chart = chart.svgHeight(size.height);
+      if (size.width > 0) {
+        chart = chart.svgWidth(size.width);
+      }
+      if (size.height > 0) {
+        chart = chart.svgHeight(size.height);
+      }
 
-      chart.setCentered(mapping.recordIdValue ?? '').render();
-      attachNavListeners();
+      chart
+        .setCentered(mapping.recordIdValue ?? "")
+        .render();
+      attachListeners();
     }
-  }, [data, size]);
+  }, [data]);
 
   return <div ref={containerRef} />;
 };
 
-// Simple circle icon
-const getIcon = (_type: string) =>
+// Minimal SVG icon generator
+const getIcon = (type: string): string =>
   `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">
      <circle cx="8" cy="8" r="6" fill="currentColor"/>
    </svg>`;
